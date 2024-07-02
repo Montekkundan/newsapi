@@ -3,6 +3,8 @@ use postgres::Error as PostgresError;
 use std::net::{TcpListener, TcpStream};
 use std::io::{Read, Write};
 use std::env;
+use reqwest;
+use scraper::{Html, Selector};
 
 #[macro_use]
 extern crate serde_derive;
@@ -62,6 +64,8 @@ fn handle_client(mut stream: TcpStream, db_url: &str) {
                 r if r.starts_with("GET /articles") => handle_get_all_request(r, db_url),
                 r if r.starts_with("PUT /articles/") => handle_put_request(r, db_url),
                 r if r.starts_with("DELETE /articles/") => handle_delete_request(r, db_url),
+                r if r.starts_with("POST /scrape/imdb") => handle_scrape_imdb(db_url),
+                r if r.starts_with("DELETE /scrape/source/imdb") => handle_delete_by_source(db_url, "imdb"),
                 _ => (NOT_FOUND.to_string(), "404 Not Found".to_string()),
             };
 
@@ -169,6 +173,86 @@ fn handle_delete_request(request: &str, db_url: &str) -> (String, String) {
             (OK_RESPONSE.to_string(), "Article deleted".to_string())
         }
         _ => (INTERNAL_SERVER_ERROR.to_string(), "Error".to_string()),
+    }
+}
+
+// Handle scrape IMDb function
+fn handle_scrape_imdb(db_url: &str) -> (String, String) {
+    println!("Starting IMDb scrape...");
+
+    let client = reqwest::blocking::Client::new();
+    let response = match client.get("https://www.imdb.com/search/title/?groups=top_100&sort=user_rating,desc&count=10")
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3")
+        .send() {
+        Ok(res) => {
+            println!("Received response from IMDb");
+            match res.text() {
+                Ok(text) => text,
+                Err(e) => {
+                    println!("Error reading response text: {}", e);
+                    return (INTERNAL_SERVER_ERROR.to_string(), "Error reading response text".to_string());
+                },
+            }
+        },
+        Err(e) => {
+            println!("Error fetching URL: {}", e);
+            return (INTERNAL_SERVER_ERROR.to_string(), format!("Error fetching URL: {}", e));
+        },
+    };
+
+    let document = Html::parse_document(&response);
+    let title_selector = match Selector::parse("h3.lister-item-header>a") {
+        Ok(sel) => sel,
+        Err(e) => {
+            println!("Error creating selector: {}", e);
+            return (INTERNAL_SERVER_ERROR.to_string(), "Error creating selector".to_string());
+        },
+    };
+
+    let titles = document.select(&title_selector).map(|x| x.inner_html());
+
+    match Client::connect(db_url, NoTls) {
+        Ok(mut client) => {
+            for (item, number) in titles.zip(1..11) {
+                let article = Article {
+                    id: None,
+                    title: item.clone(),
+                    content: format!("{}. {}", number, item),
+                    source: "imdb".to_string(),
+                };
+
+                if let Err(e) = client.execute(
+                    "INSERT INTO articles (title, content, source) VALUES ($1, $2, $3)",
+                    &[&article.title, &article.content, &article.source]
+                ) {
+                    println!("Error inserting article into database: {}", e);
+                    return (INTERNAL_SERVER_ERROR.to_string(), "Error inserting article into database".to_string());
+                }
+            }
+
+            println!("Scraping completed successfully");
+            (OK_RESPONSE.to_string(), "Scraping completed".to_string())
+        }
+        Err(e) => {
+            println!("Database connection error: {}", e);
+            (INTERNAL_SERVER_ERROR.to_string(), "Database connection error".to_string())
+        }
+    }
+}
+
+// Handle delete by source function
+fn handle_delete_by_source(db_url: &str, source: &str) -> (String, String) {
+    match Client::connect(db_url, NoTls) {
+        Ok(mut client) => {
+            let rows_affected = client.execute("DELETE FROM articles WHERE source = $1", &[&source]).unwrap();
+
+            if rows_affected == 0 {
+                return (NOT_FOUND.to_string(), "No articles found for the given source".to_string());
+            }
+
+            (OK_RESPONSE.to_string(), "Articles deleted".to_string())
+        }
+        Err(_) => (INTERNAL_SERVER_ERROR.to_string(), "Database connection error".to_string()),
     }
 }
 
